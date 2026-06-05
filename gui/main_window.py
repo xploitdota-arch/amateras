@@ -186,7 +186,7 @@ class IBEInstallThread(QThread):
                 elif "ibeeditor" in name:
                     mod_name = name
 
-            if not full_pack_name or not mod_name:
+            if not mod_name:
                 self.error_signal.emit("Не найдены файлы в релизе")
                 return
 
@@ -210,77 +210,67 @@ class IBEInstallThread(QThread):
             )
             self.log_signal.emit(f"✅ Minecraft {self.MC_VERSION} установлен")
 
-            # 4. Download and extract NeoForge full pack from GitHub
+            # 4. Установка NeoForge с помощью локального установщика
             self.progress_signal.emit(3, 6)
-            self.log_signal.emit(f"⬇ Скачивание {full_pack_name}...")
-
-            tmp_dir = Path(tempfile.mkdtemp(prefix="ibe_"))
-            pack_path = tmp_dir / full_pack_name
-            self._download(assets[full_pack_name], pack_path)
-            self.log_signal.emit(f"✅ {full_pack_name} скачан")
-
-            self.progress_signal.emit(4, 6)
-            self.log_signal.emit("📂 Распаковка NeoForge...")
-
-            libs_dir = self.mc_dir / "libraries"
-            versions_dir = self.mc_dir / "versions"
-
-            # Step 4b: Extract ALL maven libraries from installer jar (ASM, cpw.mods, etc.)
+            self.log_signal.emit("📦 Установка NeoForge из локального файла...")
+            
             installer_jar = Path(__file__).parent.parent / "neoforge-21.4.157-installer-fat.jar"
             if not installer_jar.exists():
                 self.error_signal.emit(f"Installer jar не найден: {installer_jar}")
                 return
-
-            self.log_signal.emit("📦 Извлечение maven-библиотек из инсталлера...")
-            with zipfile.ZipFile(str(installer_jar), 'r') as inst_zf:
-                maven_files = [n for n in inst_zf.namelist() if n.startswith("maven/") and n.endswith(".jar")]
-                for maven_path in maven_files:
-                    rel = maven_path[len("maven/"):]
-                    dest = libs_dir / rel
-                    if not dest.exists():
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(inst_zf.read(maven_path))
-                self.log_signal.emit(f"✅ Извлечено {len(maven_files)} maven-библиотек")
-
-            # Step 4c: Extract NeoForge files from full-pack (client jar, JSON, neoform)
-            self.log_signal.emit("📦 Извлечение NeoForge из full-pack...")
-            with zipfile.ZipFile(str(pack_path), 'r') as zf:
-                for member in zf.namelist():
-                    if member.endswith("/") or member.endswith("\\"):
-                        continue
-                    fixed = member.replace("\\", "/")
-                    file_data = zf.read(member)
-
-                    # neoforged/... → libraries/net/neoforged/...
-                    if fixed.startswith("neoforged/") and fixed.endswith(".jar"):
-                        rel = fixed[len("neoforged/"):]
-                        dest = libs_dir / "net" / "neoforged" / rel
-                        if not dest.exists():
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                            dest.write_bytes(file_data)
-                        self.log_signal.emit(f"   ✅ {dest.name}")
-
-                    # JSON → versions/ITE-21.4.157/ITE-21.4.157.json
-                    elif "neoforge-21.4.157" in fixed and fixed.endswith(".json"):
-                        if file_data[:3] == b"\xef\xbb\xbf":
-                            file_data = file_data[3:]
-                        j = json.loads(file_data)
-                        j["id"] = self.ITE_VERSION
-                        file_data = json.dumps(j, indent=2).encode("utf-8")
-                        dest = versions_dir / self.ITE_VERSION / f"{self.ITE_VERSION}.json"
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(file_data)
-                        self.log_signal.emit(f"✅ Профиль {self.ITE_VERSION} создан")
-
+                
+            # Для корректной работы инсталлера нужен launcher_profiles.json
+            profiles_json = self.mc_dir / "launcher_profiles.json"
+            if not profiles_json.exists():
+                profiles_json.write_text("{}", encoding="utf-8")
+                
+            java_path = find_java_executable(self.mc_dir) or "java"
+            
+            self.progress_signal.emit(4, 6)
+            self.log_signal.emit("⚙ Работает установщик NeoForge...")
+            try:
+                subprocess.run(
+                    [java_path, "-jar", str(installer_jar), "--installClient", str(self.mc_dir)],
+                    check=True, capture_output=True, text=True
+                )
+            except subprocess.CalledProcessError as e:
+                self.error_signal.emit(f"Ошибка установки NeoForge: {e.stderr}")
+                return
+                
+            self.progress_signal.emit(5, 6)
+            self.log_signal.emit("📝 Настройка профиля ITE...")
+            
+            versions_dir = self.mc_dir / "versions"
+            nf_dir = versions_dir / "neoforge-21.4.157"
+            ite_dir = versions_dir / self.ITE_VERSION
+            
+            # Переименовываем профиль neoforge в ITE
+            if nf_dir.exists():
+                if ite_dir.exists():
+                    import shutil
+                    shutil.rmtree(ite_dir, ignore_errors=True)
+                nf_dir.rename(ite_dir)
+                
+            nf_json = ite_dir / "neoforge-21.4.157.json"
+            ite_json = ite_dir / f"{self.ITE_VERSION}.json"
+            
+            if nf_json.exists():
+                nf_json.rename(ite_json)
+                
+            if ite_json.exists():
+                data = json.loads(ite_json.read_text(encoding="utf-8"))
+                data["id"] = self.ITE_VERSION
+                ite_json.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                
             # Copy vanilla jar as ITE jar
             vanilla_jar = versions_dir / self.MC_VERSION / f"{self.MC_VERSION}.jar"
-            ite_jar = versions_dir / self.ITE_VERSION / f"{self.ITE_VERSION}.jar"
+            ite_jar = ite_dir / f"{self.ITE_VERSION}.jar"
             if vanilla_jar.exists() and not ite_jar.exists():
+                import shutil
                 shutil.copy2(str(vanilla_jar), str(ite_jar))
                 self.log_signal.emit(f"✅ Скопирован JAR для {self.ITE_VERSION}")
 
-            self.log_signal.emit("✅ NeoForge установлен")
-
+            self.log_signal.emit("✅ NeoForge успешно установлен!")
 
             # 6. Download mod
             self.progress_signal.emit(6, 6)
@@ -295,7 +285,7 @@ class IBEInstallThread(QThread):
             else:
                 self.log_signal.emit(f"✅ Мод уже есть: {mod_name}")
 
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            
             self.finished_signal.emit()
 
         except Exception as e:
