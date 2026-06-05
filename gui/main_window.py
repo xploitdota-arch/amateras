@@ -169,7 +169,7 @@ class IBEInstallThread(QThread):
         try:
             # 1. Get release info
             self.log_signal.emit("📡 Получение информации о релизе...")
-            self.progress_signal.emit(0, 5)
+            self.progress_signal.emit(0, 6)
 
             req = urllib.request.Request(self.RELEASE_URL)
             req.add_header("User-Agent", "Amaterasu-Launcher/1.0")
@@ -191,11 +191,11 @@ class IBEInstallThread(QThread):
                 return
 
             # 2. Download Java 21
-            self.progress_signal.emit(1, 5)
+            self.progress_signal.emit(1, 6)
             download_java(self.mc_dir, log_fn=lambda s: self.log_signal.emit(s))
 
             # 3. Install vanilla MC 1.21.4
-            self.progress_signal.emit(2, 5)
+            self.progress_signal.emit(2, 6)
             self.log_signal.emit(f"📦 Установка Minecraft {self.MC_VERSION}...")
 
             self._ibe_max = 100
@@ -211,7 +211,7 @@ class IBEInstallThread(QThread):
             self.log_signal.emit(f"✅ Minecraft {self.MC_VERSION} установлен")
 
             # 4. Download and extract NeoForge full pack from GitHub
-            self.progress_signal.emit(3, 5)
+            self.progress_signal.emit(3, 6)
             self.log_signal.emit(f"⬇ Скачивание {full_pack_name}...")
 
             tmp_dir = Path(tempfile.mkdtemp(prefix="ibe_"))
@@ -219,35 +219,54 @@ class IBEInstallThread(QThread):
             self._download(assets[full_pack_name], pack_path)
             self.log_signal.emit(f"✅ {full_pack_name} скачан")
 
-            self.progress_signal.emit(4, 5)
+            self.progress_signal.emit(4, 6)
             self.log_signal.emit("📂 Распаковка NeoForge...")
 
             libs_dir = self.mc_dir / "libraries"
             versions_dir = self.mc_dir / "versions"
 
+            # Step 4b: Extract ALL maven libraries from installer jar (ASM, cpw.mods, etc.)
+            installer_jar = Path(__file__).parent.parent / "neoforge-21.4.157-installer-fat.jar"
+            if not installer_jar.exists():
+                self.error_signal.emit(f"Installer jar не найден: {installer_jar}")
+                return
+
+            self.log_signal.emit("📦 Извлечение maven-библиотек из инсталлера...")
+            with zipfile.ZipFile(str(installer_jar), 'r') as inst_zf:
+                maven_files = [n for n in inst_zf.namelist() if n.startswith("maven/") and n.endswith(".jar")]
+                for maven_path in maven_files:
+                    rel = maven_path[len("maven/"):]
+                    dest = libs_dir / rel
+                    if not dest.exists():
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(inst_zf.read(maven_path))
+                self.log_signal.emit(f"✅ Извлечено {len(maven_files)} maven-библиотек")
+
+            # Step 4c: Extract NeoForge files from full-pack (client jar, JSON, neoform)
+            self.log_signal.emit("📦 Извлечение NeoForge из full-pack...")
             with zipfile.ZipFile(str(pack_path), 'r') as zf:
                 for member in zf.namelist():
                     if member.endswith("/") or member.endswith("\\"):
                         continue
-
-                    file_data = zf.read(member)
                     fixed = member.replace("\\", "/")
+                    file_data = zf.read(member)
 
                     # neoforged/... → libraries/net/neoforged/...
-                    if fixed.startswith("neoforged/"):
+                    if fixed.startswith("neoforged/") and fixed.endswith(".jar"):
                         rel = fixed[len("neoforged/"):]
                         dest = libs_dir / "net" / "neoforged" / rel
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(file_data)
+                        if not dest.exists():
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            dest.write_bytes(file_data)
+                        self.log_signal.emit(f"   ✅ {dest.name}")
 
-                    # neoforge-21.4.157/*.json → versions/ITE-21.4.157/ITE-21.4.157.json
+                    # JSON → versions/ITE-21.4.157/ITE-21.4.157.json
                     elif "neoforge-21.4.157" in fixed and fixed.endswith(".json"):
                         if file_data[:3] == b"\xef\xbb\xbf":
                             file_data = file_data[3:]
                         j = json.loads(file_data)
                         j["id"] = self.ITE_VERSION
                         file_data = json.dumps(j, indent=2).encode("utf-8")
-
                         dest = versions_dir / self.ITE_VERSION / f"{self.ITE_VERSION}.json"
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         dest.write_bytes(file_data)
@@ -258,11 +277,13 @@ class IBEInstallThread(QThread):
             ite_jar = versions_dir / self.ITE_VERSION / f"{self.ITE_VERSION}.jar"
             if vanilla_jar.exists() and not ite_jar.exists():
                 shutil.copy2(str(vanilla_jar), str(ite_jar))
+                self.log_signal.emit(f"✅ Скопирован JAR для {self.ITE_VERSION}")
 
             self.log_signal.emit("✅ NeoForge установлен")
 
-            # 5. Download mod
-            self.progress_signal.emit(5, 5)
+
+            # 6. Download mod
+            self.progress_signal.emit(6, 6)
             mods_dir = self.mc_dir / "mods"
             mods_dir.mkdir(exist_ok=True)
             mod_path = mods_dir / mod_name
@@ -581,15 +602,17 @@ class ParticleOverlay(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         for p in self.particles:
-            alpha = int(p.life * 255)
+            alpha = max(0, min(255, int(p.life * 255)))
+            hue = max(0, min(359, int(p.hue) % 360))
+            val = max(0, min(255, int(p.brightness)))
             # Core color
-            color = QColor.fromHsv(p.hue, 180, p.brightness, alpha)
+            color = QColor.fromHsv(hue, 180, val, alpha)
 
             # Glow
             grad = QRadialGradient(p.x, p.y, p.size * 3)
-            grad.setColorAt(0, QColor(p.brightness, 100, 255, alpha))
+            grad.setColorAt(0, QColor(val, 100, 255, alpha))
             grad.setColorAt(0.4, color)
-            grad.setColorAt(1, QColor(p.hue % 256, 0, p.brightness // 2, 0))
+            grad.setColorAt(1, QColor(hue % 256, 0, val // 2, 0))
 
             painter.setBrush(grad)
             painter.setPen(Qt.PenStyle.NoPen)
