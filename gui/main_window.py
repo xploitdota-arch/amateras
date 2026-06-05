@@ -1,4 +1,5 @@
 import sys
+import os
 import json
 import shutil
 import subprocess
@@ -10,14 +11,18 @@ from PyQt6.QtWidgets import (
     QLineEdit, QFrame, QGraphicsDropShadowEffect, QProgressBar,
     QStackedWidget, QListWidget, QListWidgetItem, QMessageBox
 )
-from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRectF
 from PyQt6.QtGui import (
     QFont, QFontDatabase, QPixmap, QPainter, QColor, QCursor, QMovie,
-    QPen, QPainterPath
+    QPen, QPainterPath, QLinearGradient, QRadialGradient, QRegion, QIcon
 )
+import random
+import math
 
 from launcher.api import get_version_list
 from launcher.launcher_core import get_offline_uuid
+from launcher.java_installer import download_java, find_java_executable, is_java_installed
+from launcher.neoforge_installer import install_neoforge
 import minecraft_launcher_lib as mll
 
 SETTINGS_PATH = Path(__file__).parent.parent / "launcher_settings.json"
@@ -58,19 +63,23 @@ class InstallThread(QThread):
 
     def run(self):
         try:
-            def set_status(s: str):
-                self.log_signal.emit(f"   ...{s}")
-            def set_max(m: int):
-                self._max = max(m, 1)
-                self.progress_signal.emit(0, self._max)
-            def set_progress(p: int):
-                self.progress_signal.emit(p, self._max)
+            # Для ITE/NeoForge версий — пропускаем install (файлы уже есть)
+            if not self.version.startswith("ITE-"):
+                def set_status(s: str):
+                    self.log_signal.emit(f"   ...{s}")
+                def set_max(m: int):
+                    self._max = max(m, 1)
+                    self.progress_signal.emit(0, self._max)
+                def set_progress(p: int):
+                    self.progress_signal.emit(p, self._max)
 
-            mll.install.install_minecraft_version(
-                self.version, str(self.mc_dir),
-                callback={"setStatus": set_status, "setMax": set_max, "setProgress": set_progress}
-            )
-            self.log_signal.emit("✅ Файлы готовы")
+                mll.install.install_minecraft_version(
+                    self.version, str(self.mc_dir),
+                    callback={"setStatus": set_status, "setMax": set_max, "setProgress": set_progress}
+                )
+                self.log_signal.emit("✅ Файлы готовы")
+            else:
+                self.log_signal.emit("✅ NeoForge — пропуск установки (файлы готовы)")
 
             options = {
                 "username": self.username,
@@ -81,8 +90,12 @@ class InstallThread(QThread):
                 "gameDirectory": str(self.mc_dir),
                 "jvmArguments": [f"-Xmx{self.settings.get('ram','2G')}"],
             }
-            if self.settings.get("java_path"):
-                options["executablePath"] = self.settings["java_path"]
+            # Java: настройки → Adoptium → системная
+            java_path = self.settings.get("java_path", "")
+            if not java_path:
+                java_path = find_java_executable(self.mc_dir) or ""
+            if java_path:
+                options["executablePath"] = java_path
 
             cmd = mll.command.get_minecraft_command(self.version, str(self.mc_dir), options)
             self.log_signal.emit(f"☕ Java: {Path(cmd[0]).name}")
@@ -124,6 +137,214 @@ class DownloadThread(QThread):
             self.error_signal.emit(str(e))
 
 
+# ─── Mod Install Thread ───
+
+class IBEInstallThread(QThread):
+    """Downloads and installs IBE Editor from GitHub releases."""
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
+    finished_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+
+    RELEASE_URL = "https://api.github.com/repos/Wynasik/mods/releases/tags/0.2.0"
+    MC_VERSION = "1.21.4"
+    ITE_VERSION = "ITE-21.4.157"
+
+    def __init__(self, mc_dir: Path, parent=None):
+        super().__init__(parent)
+        self.mc_dir = mc_dir
+
+    def _download(self, url: str, dest: Path):
+        import urllib.request
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "Amaterasu-Launcher/1.0")
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            dest.write_bytes(resp.read())
+
+    def run(self):
+        import urllib.request
+        import zipfile
+        import tempfile
+
+        try:
+            # 1. Get release info
+            self.log_signal.emit("📡 Получение информации о релизе...")
+            self.progress_signal.emit(0, 5)
+
+            req = urllib.request.Request(self.RELEASE_URL)
+            req.add_header("User-Agent", "Amaterasu-Launcher/1.0")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+
+            assets = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
+
+            full_pack_name = None
+            mod_name = None
+            for name in assets:
+                if "full-pack" in name:
+                    full_pack_name = name
+                elif "ibeeditor" in name:
+                    mod_name = name
+
+            if not full_pack_name or not mod_name:
+                self.error_signal.emit("Не найдены файлы в релизе")
+                return
+
+            # 2. Download Java 21
+            self.progress_signal.emit(1, 5)
+            download_java(self.mc_dir, log_fn=lambda s: self.log_signal.emit(s))
+
+            # 3. Install vanilla MC 1.21.4
+            self.progress_signal.emit(2, 5)
+            self.log_signal.emit(f"📦 Установка Minecraft {self.MC_VERSION}...")
+
+            self._ibe_max = 100
+            def ibe_status(s): self.log_signal.emit(f"   ...{s}")
+            def ibe_max(m): self._ibe_max = max(m, 1)
+            def ibe_progress(p):
+                if self._ibe_max > 0 and (p % 50 == 0 or p == self._ibe_max):
+                    self.log_signal.emit(f"   📥 {p}/{self._ibe_max}")
+            mll.install.install_minecraft_version(
+                self.MC_VERSION, str(self.mc_dir),
+                callback={"setStatus": ibe_status, "setMax": ibe_max, "setProgress": ibe_progress}
+            )
+            self.log_signal.emit(f"✅ Minecraft {self.MC_VERSION} установлен")
+
+            # 4. Download and extract NeoForge full pack from GitHub
+            self.progress_signal.emit(3, 5)
+            self.log_signal.emit(f"⬇ Скачивание {full_pack_name}...")
+
+            tmp_dir = Path(tempfile.mkdtemp(prefix="ibe_"))
+            pack_path = tmp_dir / full_pack_name
+            self._download(assets[full_pack_name], pack_path)
+            self.log_signal.emit(f"✅ {full_pack_name} скачан")
+
+            self.progress_signal.emit(4, 5)
+            self.log_signal.emit("📂 Распаковка NeoForge...")
+
+            libs_dir = self.mc_dir / "libraries"
+            versions_dir = self.mc_dir / "versions"
+
+            with zipfile.ZipFile(str(pack_path), 'r') as zf:
+                for member in zf.namelist():
+                    if member.endswith("/") or member.endswith("\\"):
+                        continue
+
+                    file_data = zf.read(member)
+                    fixed = member.replace("\\", "/")
+
+                    # neoforged/... → libraries/net/neoforged/...
+                    if fixed.startswith("neoforged/"):
+                        rel = fixed[len("neoforged/"):]
+                        dest = libs_dir / "net" / "neoforged" / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(file_data)
+
+                    # neoforge-21.4.157/*.json → versions/ITE-21.4.157/ITE-21.4.157.json
+                    elif "neoforge-21.4.157" in fixed and fixed.endswith(".json"):
+                        if file_data[:3] == b"\xef\xbb\xbf":
+                            file_data = file_data[3:]
+                        j = json.loads(file_data)
+                        j["id"] = self.ITE_VERSION
+                        file_data = json.dumps(j, indent=2).encode("utf-8")
+
+                        dest = versions_dir / self.ITE_VERSION / f"{self.ITE_VERSION}.json"
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(file_data)
+                        self.log_signal.emit(f"✅ Профиль {self.ITE_VERSION} создан")
+
+            # Copy vanilla jar as ITE jar
+            vanilla_jar = versions_dir / self.MC_VERSION / f"{self.MC_VERSION}.jar"
+            ite_jar = versions_dir / self.ITE_VERSION / f"{self.ITE_VERSION}.jar"
+            if vanilla_jar.exists() and not ite_jar.exists():
+                shutil.copy2(str(vanilla_jar), str(ite_jar))
+
+            self.log_signal.emit("✅ NeoForge установлен")
+
+            # 5. Download mod
+            self.progress_signal.emit(5, 5)
+            mods_dir = self.mc_dir / "mods"
+            mods_dir.mkdir(exist_ok=True)
+            mod_path = mods_dir / mod_name
+
+            if not mod_path.exists():
+                self.log_signal.emit(f"⬇ Скачивание {mod_name}...")
+                self._download(assets[mod_name], mod_path)
+                self.log_signal.emit(f"✅ Мод: {mod_name}")
+            else:
+                self.log_signal.emit(f"✅ Мод уже есть: {mod_name}")
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            self.finished_signal.emit()
+
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+
+
+class VersionListThread(QThread):
+    """Загружает список версий в фоне."""
+    finished = pyqtSignal(list)  # list of version dicts
+    error = pyqtSignal(str)
+
+    def run(self):
+        try:
+            versions = get_version_list()
+            self.finished.emit(versions)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class ModInstallThread(QThread):
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
+    finished_signal = pyqtSignal(str)  # installed version id
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, mod_type: str, mc_version: str, mc_dir: Path, parent=None):
+        super().__init__(parent)
+        self.mod_type = mod_type  # "forge" or "fabric"
+        self.mc_version = mc_version
+        self.mc_dir = mc_dir
+        self._max = 100
+
+    def run(self):
+        try:
+            def set_status(s: str):
+                self.log_signal.emit(f"   ...{s}")
+            def set_max(m: int):
+                self._max = max(m, 1)
+                self.progress_signal.emit(0, self._max)
+            def set_progress(p: int):
+                self.progress_signal.emit(p, self._max)
+
+            callback = {"setStatus": set_status, "setMax": set_max, "setProgress": set_progress}
+
+            if self.mod_type == "forge":
+                self.log_signal.emit(f"🔨 Установка Forge для {self.mc_version}...")
+                forge_ver = mll.forge.find_forge_version(self.mc_version)
+                if not forge_ver:
+                    self.error_signal.emit(f"Forge не найден для {self.mc_version}")
+                    return
+                self.log_signal.emit(f"📦 Forge: {forge_ver}")
+                mll.forge.install_forge_version(forge_ver, str(self.mc_dir), callback=callback)
+                installed_id = forge_ver
+            else:
+                self.log_signal.emit(f"🧵 Установка Fabric для {self.mc_version}...")
+                if not mll.fabric.is_minecraft_version_supported(self.mc_version):
+                    self.error_signal.emit(f"Fabric не поддерживает {self.mc_version}")
+                    return
+                mll.fabric.install_fabric(self.mc_version, str(self.mc_dir), callback=callback)
+                loader = mll.fabric.get_latest_loader_version()
+                installed_id = f"fabric-loader-{loader}-{self.mc_version}"
+
+            self.log_signal.emit(f"✅ {self.mod_type.capitalize()} установлен!")
+            self.finished_signal.emit(installed_id)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
 # ─── Rounded Popup Menu ───
 
 class RoundedMenu(QFrame):
@@ -133,29 +354,29 @@ class RoundedMenu(QFrame):
         super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.setStyleSheet("""
             RoundedMenu {
-                background-color: #1a0808;
-                border: 1px solid #5a2020;
-                border-radius: 8px;
+                background-color: #1a0a20;
+                border: 1px solid #4a2060;
+                border-radius: 10px;
             }
             QPushButton {
                 background: transparent;
                 border: none;
-                color: #c0a0a0;
-                padding: 9px 18px;
+                color: #c0a0d0;
+                padding: 10px 20px;
                 font-size: 13px;
                 text-align: left;
-                border-radius: 4px;
+                border-radius: 6px;
             }
             QPushButton:hover {
-                background-color: #3a1515;
-                color: #ffd6d6;
+                background-color: #2a1040;
+                color: #e0c0ff;
             }
         """)
         v = QVBoxLayout(self)
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(2)
 
-        for idx, label in [(1, "Менеджер версий"), (2, "Настройки лаунчера")]:
+        for idx, label in [(1, "⚡ Менеджер версий"), (3, "🧩 Моды"), (2, "⚙ Настройки лаунчера")]:
             btn = QPushButton(label)
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             btn.clicked.connect(lambda checked, i=idx: self.page_selected.emit(i))
@@ -164,10 +385,10 @@ class RoundedMenu(QFrame):
         v.addSpacing(4)
         sep = QFrame()
         sep.setFixedHeight(1)
-        sep.setStyleSheet("background-color: #3a1515;")
+        sep.setStyleSheet("background-color: #3a1555;")
         v.addWidget(sep)
         lbl = QLabel("Amaterasu v1.0")
-        lbl.setStyleSheet("color:#5a3030;font-size:10px;padding:2px 4px;")
+        lbl.setStyleSheet("color:#5a3070;font-size:10px;padding:2px 4px;")
         v.addWidget(lbl)
         self.adjustSize()
 
@@ -178,7 +399,7 @@ class IconBtn(QPushButton):
     def __init__(self, icon_type: str, tooltip: str, parent=None):
         super().__init__(parent)
         self.icon_type = icon_type
-        self.setFixedSize(30, 30)
+        self.setFixedSize(34, 34)
         self.setToolTip(tooltip)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setStyleSheet("background: transparent; border: none;")
@@ -196,17 +417,17 @@ class IconBtn(QPushButton):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        c = QColor(220, 50, 50) if self._hover else QColor(140, 80, 80)
+        c = QColor(180, 100, 255) if self._hover else QColor(120, 80, 160)
         painter.setPen(QPen(c, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        r = self.rect().adjusted(4, 4, -4, -4)
+        r = self.rect().adjusted(5, 5, -5, -5)
         cx, cy = r.center().x(), r.center().y()
 
         if self.icon_type == "info":
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(r)
             painter.setPen(QPen(c, 2))
-            painter.drawPoint(cx, cy - 2)
-            painter.drawLine(cx, cy, cx, cy + 4)
+            painter.drawPoint(cx, cy - 3)
+            painter.drawLine(cx, cy, cx, cy + 5)
         elif self.icon_type == "folder":
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(r.x(), r.y() + 5, r.width(), r.height() - 5)
@@ -259,7 +480,7 @@ class GifBg(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(10, 2, 2))
+        painter.fillRect(self.rect(), QColor(8, 4, 14, 255))
         if self.pixmap and not self.pixmap.isNull():
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             scaled = self.pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -269,42 +490,430 @@ class GifBg(QWidget):
         painter.end()
 
 
+# ─── Particle for launch effect ───
+
+class Particle:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        angle = random.uniform(0, 2 * math.pi)
+        speed = random.uniform(1.5, 5.0)
+        self.vx = math.cos(angle) * speed
+        self.vy = math.sin(angle) * speed - random.uniform(1, 3)  # bias upward
+        self.life = random.uniform(0.6, 1.0)
+        self.decay = random.uniform(0.015, 0.035)
+        self.size = random.uniform(2, 5)
+        # Purple-ish colors
+        self.hue = random.randint(250, 290)
+        self.brightness = random.randint(160, 255)
+
+    def update(self):
+        self.x += self.vx
+        self.y += self.vy
+        self.vy += 0.08  # gravity
+        self.vx *= 0.98
+        self.life -= self.decay
+        self.size *= 0.97
+
+    def is_alive(self):
+        return self.life > 0 and self.size > 0.5
+
+
+class ParticleOverlay(QWidget):
+    """Transparent overlay that draws particles over the launch button area."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.particles: list[Particle] = []
+        self._active = False
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)  # ~60fps
+        self._timer.timeout.connect(self._tick)
+
+    def start(self, source_rect):
+        """Start emitting particles from source_rect (in parent coords)."""
+        self._source = source_rect
+        self._active = True
+        self._spawn_counter = 0
+        self.particles.clear()
+        self.raise_()
+        self.show()
+        self._timer.start()
+
+    def stop(self):
+        self._active = False
+        # Let existing particles die out
+
+    def _tick(self):
+        # Spawn new particles if active
+        if self._active:
+            self._spawn_counter += 1
+            for _ in range(3):  # 3 particles per frame
+                x = self._source.x() + random.randint(0, self._source.width())
+                y = self._source.y() + random.randint(-5, 5)
+                # Emit from edges and top
+                if random.random() < 0.5:
+                    y = self._source.y() - random.randint(0, 10)
+                else:
+                    x = self._source.x() + random.choice([0, self._source.width()])
+                    y = self._source.y() + random.randint(0, self._source.height())
+                self.particles.append(Particle(x, y))
+
+        # Update particles
+        self.particles = [p for p in self.particles if p.is_alive()]
+        for p in self.particles:
+            p.update()
+
+        # Stop timer when no particles left
+        if not self._active and not self.particles:
+            self._timer.stop()
+            self.hide()
+
+        self.update()
+
+    def paintEvent(self, event):
+        if not self.particles:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        for p in self.particles:
+            alpha = int(p.life * 255)
+            # Core color
+            color = QColor.fromHsv(p.hue, 180, p.brightness, alpha)
+
+            # Glow
+            grad = QRadialGradient(p.x, p.y, p.size * 3)
+            grad.setColorAt(0, QColor(p.brightness, 100, 255, alpha))
+            grad.setColorAt(0.4, color)
+            grad.setColorAt(1, QColor(p.hue % 256, 0, p.brightness // 2, 0))
+
+            painter.setBrush(grad)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QRectF(p.x - p.size, p.y - p.size, p.size * 2, p.size * 2))
+
+        painter.end()
+
+
+# ─── Animated Launch Button ───
+
+class AnimatedLaunchBtn(QPushButton):
+    """Launch button with pulsing glow and spinner animation while loading."""
+
+    SPINNER_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._base_text = text
+        self._loading = False
+        self._spinner_idx = 0
+        self._glow_phase = 0.0
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(50)
+        self._pulse_timer.timeout.connect(self._pulse_tick)
+
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(80)
+        self._spinner_timer.timeout.connect(self._spinner_tick)
+
+        self._glow_effect = None
+
+    def set_glow(self, effect: QGraphicsDropShadowEffect):
+        self._glow_effect = effect
+
+    def start_loading(self, text="ЗАГРУЗКА..."):
+        self._loading = True
+        self._base_text = text
+        self._spinner_idx = 0
+        self._glow_phase = 0.0
+        self._pulse_timer.start()
+        self._spinner_timer.start()
+
+    def stop_loading(self, text="▶  ЗАПУСТИТЬ"):
+        self._loading = False
+        self._pulse_timer.stop()
+        self._spinner_timer.stop()
+        self.setText(text)
+        if self._glow_effect:
+            self._glow_effect.setColor(QColor(120, 40, 200, 180))
+            self._glow_effect.setBlurRadius(28)
+
+    def _pulse_tick(self):
+        self._glow_phase += 0.12
+        if self._glow_effect:
+            # Pulsating glow: blur radius oscillates 20..50
+            t = (math.sin(self._glow_phase) + 1) / 2  # 0..1
+            blur = 20 + t * 35
+            alpha = int(120 + t * 135)
+            # Shift hue slightly for shimmer
+            hue_shift = int(math.sin(self._glow_phase * 0.7) * 20)
+            r = max(0, min(255, 120 + hue_shift))
+            g = max(0, min(255, 40))
+            b = max(0, min(255, 220 - hue_shift))
+            self._glow_effect.setColor(QColor(r, g, b, alpha))
+            self._glow_effect.setBlurRadius(blur)
+
+    def _spinner_tick(self):
+        if self._loading:
+            char = self.SPINNER_CHARS[self._spinner_idx % len(self.SPINNER_CHARS)]
+            self.setText(f"{char}  {self._base_text}")
+            self._spinner_idx += 1
+
+
+# ─── Separator Line ───
+
+class GlowSeparator(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(2)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        grad.setColorAt(0.0, QColor(0, 0, 0, 0))
+        grad.setColorAt(0.3, QColor(140, 60, 220, 200))
+        grad.setColorAt(0.5, QColor(180, 100, 255, 255))
+        grad.setColorAt(0.7, QColor(140, 60, 220, 200))
+        grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillRect(self.rect(), grad)
+        painter.end()
+
+
 # ─── Stylesheet ───
 
-def stylesheet() -> str:
-    return """
-    QWidget{color:#ffd6d6;font-family:"Segoe UI";font-size:13px;}
-    #LeftPanel{background-color:rgba(12,3,3,235);border:none;border-right:1px solid rgba(160,30,30,60);border-radius:12px;}
-    #RightPanel{background-color:#0a0202;border:none;border-left:1px solid rgba(160,30,30,60);border-radius:12px;}
-    #CenterBg{border-radius:12px;}
-    #TopBar{background-color:rgba(10,2,2,245);border-bottom:1px solid rgba(160,30,30,90);}
-    QLineEdit{background-color:rgba(30,6,6,200);border:1px solid rgba(150,40,40,130);border-radius:6px;padding:6px 10px;color:#ffd6d6;font-size:13px;}
-    QLineEdit:focus{border:1px solid #c04040;}
-    QComboBox{background-color:rgba(30,6,6,200);border:1px solid rgba(150,40,40,130);border-radius:6px;padding:6px 10px;padding-right:28px;color:#ffd6d6;font-size:13px;}
-    QComboBox::drop-down{background:transparent;border:none;width:24px;}
-    QComboBox::down-arrow{image:none;border-left:5px solid transparent;border-right:5px solid transparent;border-top:7px solid #b03030;width:0;height:0;margin-top:2px;}
-    QComboBox QAbstractItemView{background:#140505;border:1px solid #5a1515;selection-background-color:#3a1010;color:#ffd6d6;padding:4px;}
-    QCheckBox{spacing:8px;color:#c08080;font-size:12px;}
-    QCheckBox::indicator{width:16px;height:16px;border-radius:3px;border:1px solid #7b2020;background:rgba(25,6,6,180);}
-    QCheckBox::indicator:checked{background:#d03030;border:1px solid #ff3d3d;}
-    QProgressBar{background-color:rgba(30,6,6,200);border:1px solid rgba(150,40,40,130);border-radius:5px;color:#ffd6d6;text-align:center;font-size:11px;max-height:18px;}
-    QProgressBar::chunk{background-color:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #5a1212,stop:1 #e03030);border-radius:4px;}
-    #LaunchBtn{background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #5a1212,stop:1 #2a0606);border:1px solid #901515;border-radius:8px;padding:14px;font-size:15px;font-weight:bold;color:#fff;margin:4px 0;}
-    #LaunchBtn:hover{background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #7a1a1a,stop:1 #4a0a0a);border:1px solid #cc2222;}
-    #LaunchBtn:pressed{background-color:#1a0404;padding-top:15px;padding-bottom:13px;}
-    #LaunchBtn:disabled{background-color:#2a1212;color:#7b5050;border:1px solid #4a1515;}
-    QTextEdit#Log{background-color:rgba(8,2,2,200);border:1px solid rgba(140,40,40,60);border-radius:6px;color:#ff9999;font-family:Consolas;font-size:11px;padding:6px;}
-    #WinBtn{background:transparent;border:none;color:#a06060;font-size:15px;padding:2px 10px;border-radius:4px;}
-    #WinBtn:hover{background-color:rgba(150,30,30,50);color:#fff;}
-    #CloseBtn{background:transparent;border:none;color:#a06060;font-size:15px;padding:2px 10px;border-radius:4px;}
-    #CloseBtn:hover{background-color:#aa0000;color:#fff;}
-    QListWidget{background-color:rgba(20,5,5,200);border:1px solid rgba(150,40,40,100);border-radius:6px;color:#ffd6d6;outline:none;}
-    QListWidget::item{padding:7px 10px;border-bottom:1px solid rgba(150,40,40,30);}
-    QListWidget::item:selected{background-color:#5a1212;color:#fff;border-radius:4px;}
-    QListWidget::item:hover{background-color:rgba(80,15,15,60);}
-    #ActBtn{background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #4a1010,stop:1 #2a0505);border:1px solid #701515;border-radius:6px;padding:8px 16px;color:#ffd6d6;font-size:13px;}
-    #ActBtn:hover{background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #6a1a1a,stop:1 #3a0808);border:1px solid #a02020;color:#fff;}
-    #PageTitle{font-size:20px;font-weight:bold;color:#e03030;padding-bottom:8px;}
+def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
+    return f"""
+    QWidget{{color:#e0d0f0;font-family:"Segoe UI";font-size:13px;}}
+    #LeftPanel{{
+        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 rgba(18,8,30,250),
+            stop:0.5 rgba(12,5,22,252),
+            stop:1 rgba(18,8,30,250));
+        border:none;
+        border-right:1px solid rgba(120,50,180,40);
+    }}
+    #RightPanel{{
+        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 rgba(18,8,30,250),
+            stop:1 rgba(12,5,22,252));
+        border:none;
+        border-left:1px solid rgba(120,50,180,40);
+    }}
+    #CenterBg{{
+        background-color:#08040e;
+    }}
+    #TopBar{{
+        background-color:rgba(12,5,20,252);
+        border-bottom:1px solid rgba(140,60,220,60);
+    }}
+
+    QLineEdit{{
+        background-color:rgba(25,12,40,200);
+        border:1px solid rgba(120,50,180,100);
+        border-radius:8px;
+        padding:8px 12px;
+        color:#e0d0f0;
+        font-size:13px;
+        selection-background-color:#5a2090;
+    }}
+    QLineEdit:focus{{border:1px solid #9050e0;}}
+    QLineEdit::placeholder{{color:rgba(160,130,200,120);}}
+
+    QComboBox{{
+        background-color:rgba(25,12,40,200);
+        border:1px solid rgba(120,50,180,100);
+        border-radius:8px;
+        padding:8px 12px;
+        padding-right:28px;
+        color:#e0d0f0;
+        font-size:13px;
+    }}
+    QComboBox::drop-down{{background:transparent;border:none;width:24px;}}
+    QComboBox::down-arrow{{
+        image:none;
+        border-left:5px solid transparent;
+        border-right:5px solid transparent;
+        border-top:7px solid #8040c0;
+        width:0;height:0;margin-top:2px;
+    }}
+    QComboBox QAbstractItemView{{
+        background:#140822;
+        border:1px solid #4a2060;
+        selection-background-color:#3a1555;
+        color:#e0d0f0;
+        padding:4px;
+        border-radius:6px;
+    }}
+
+    QCheckBox{{spacing:8px;color:#a090c0;font-size:12px;}}
+    QCheckBox::indicator{{
+        width:18px;height:18px;border-radius:4px;
+        border:1px solid #6030a0;
+        background:rgba(20,10,35,200);
+    }}
+    QCheckBox::indicator:hover{{border:1px solid #9050e0;}}
+    QCheckBox::indicator:checked{{
+        background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #7030b0,stop:1 #a050e0);
+        border:1px solid #b070ff;
+    }}
+
+    QProgressBar{{
+        background-color:rgba(20,10,35,200);
+        border:1px solid rgba(120,50,180,80);
+        border-radius:6px;
+        color:#e0d0f0;
+        text-align:center;
+        font-size:11px;
+        max-height:20px;
+    }}
+    QProgressBar::chunk{{
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+            stop:0 #4a1580,stop:0.5 #8040d0,stop:1 #b060ff);
+        border-radius:5px;
+    }}
+
+    #LaunchBtn{{
+        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 #6020a0,stop:0.5 #4a1580,stop:1 #30105a);
+        border:1px solid #7030b0;
+        border-radius:10px;
+        padding:14px;
+        font-family:"{mc_font}";
+        font-size:16px;
+        font-weight:bold;
+        color:#fff;
+        margin:6px 0;
+    }}
+    #LaunchBtn:hover{{
+        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 #7830c0,stop:0.5 #5a20a0,stop:1 #3a1570);
+        border:1px solid #a050e0;
+    }}
+    #LaunchBtn:pressed{{
+        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 #2a0845,stop:1 #4a1580);
+        padding-top:15px;padding-bottom:13px;
+    }}
+    #LaunchBtn:disabled{{
+        background-color:rgba(30,15,50,200);
+        color:#6050a0;
+        border:1px solid #3a2060;
+    }}
+
+    QTextEdit#Log{{
+        background-color:rgba(12,6,22,220);
+        border:1px solid rgba(100,40,160,50);
+        border-radius:8px;
+        color:#c0a0e0;
+        font-family:Consolas,"Courier New",monospace;
+        font-size:11px;
+        padding:8px;
+        selection-background-color:#4a2070;
+    }}
+
+    #WinBtn{{
+        background:transparent;border:none;
+        color:#8070a0;font-size:16px;
+        padding:2px 10px;border-radius:6px;
+    }}
+    #WinBtn:hover{{background-color:rgba(120,50,180,40);color:#e0d0f0;}}
+
+    #CloseBtn{{
+        background:transparent;border:none;
+        color:#8070a0;font-size:16px;
+        padding:2px 10px;border-radius:6px;
+    }}
+    #CloseBtn:hover{{background-color:#8020c0;color:#fff;}}
+
+    QListWidget{{
+        background-color:rgba(18,8,30,220);
+        border:1px solid rgba(120,50,180,60);
+        border-radius:8px;
+        color:#e0d0f0;
+        outline:none;
+    }}
+    QListWidget::item{{
+        padding:8px 12px;
+        border-bottom:1px solid rgba(120,50,180,20);
+    }}
+    QListWidget::item:selected{{
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+            stop:0 #3a1560,stop:1 #2a1040);
+        color:#fff;
+        border-radius:6px;
+    }}
+    QListWidget::item:hover{{background-color:rgba(80,30,130,40);}}
+
+    #ActBtn{{
+        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 #3a1560,stop:1 #200a38);
+        border:1px solid #5a2080;
+        border-radius:8px;
+        padding:9px 18px;
+        color:#d0c0e0;
+        font-family:"{mc_font}";
+        font-size:13px;
+    }}
+    #ActBtn:checked{{
+        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 #6020a0,stop:1 #4a1580);
+        border:1px solid #9050e0;
+        color:#fff;
+    }}
+    #ActBtn:hover{{
+        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 #5a2090,stop:1 #3a1060);
+        border:1px solid #8040c0;
+        color:#fff;
+    }}
+
+    #PageTitle{{
+        font-family:"{mc_font}";
+        font-size:20px;
+        font-weight:bold;
+        color:#b070ff;
+        padding-bottom:8px;
+    }}
+    #McLabel{{
+        font-family:"{mc_font}";
+        font-size:12px;
+        color:#9080b0;
+    }}
+    #TitleBarLabel{{
+        font-family:"{title_font}";
+        font-size:22px;
+        font-weight:normal;
+        color:#ffffff;
+        letter-spacing:4px;
+    }}
+    #VersionLabel{{
+        color:#8070a0;
+        font-size:11px;
+    }}
+    #ConsoleLabel{{
+        color:#7060a0;
+        font-size:11px;
+        font-family:"{mc_font}";
+    }}
+
+    QScrollBar:vertical{{
+        background:rgba(15,8,25,150);
+        width:8px;
+        border-radius:4px;
+        margin:2px;
+    }}
+    QScrollBar::handle:vertical{{
+        background:rgba(120,60,180,120);
+        border-radius:4px;
+        min-height:30px;
+    }}
+    QScrollBar::handle:vertical:hover{{background:rgba(150,80,220,180);}}
+    QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
+    QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{{background:none;}}
     """
 
 
@@ -323,11 +932,19 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(820, 480)
         self._drag_pos = None
 
+        # ─── Fade in setup ───
+        self.setWindowOpacity(0.0)
+
         self.mc_dir = Path(__file__).parent.parent / ".minecraft"
         self.mc_dir.mkdir(exist_ok=True)
 
+        # ─── Иконка на панели задач ───
+        icon_path = Path(__file__).parent.parent / "assets" / "icon_amaterasu.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
         # ─── Загрузка Minecraft шрифта ───
-        font_path = Path(__file__).parent.parent / "assets" / "minecraft-rus.ttf"
+        font_path = Path(__file__).parent.parent / "fonts" / "minecraft-rus.ttf"
         font_id = QFontDatabase.addApplicationFont(str(font_path))
         if font_id != -1:
             families = QFontDatabase.applicationFontFamilies(font_id)
@@ -335,10 +952,20 @@ class MainWindow(QMainWindow):
         else:
             self.mc_font = "Segoe UI"
 
+        # ─── Загрузка шрифта для заголовка (Yuji Syuku) ───
+        title_font_path = Path(__file__).parent.parent / "fonts" / "yuji-syuku.ttf"
+        title_font_id = QFontDatabase.addApplicationFont(str(title_font_path))
+        if title_font_id != -1:
+            title_families = QFontDatabase.applicationFontFamilies(title_font_id)
+            self.title_font = title_families[0] if title_families else "Segoe UI"
+        else:
+            self.title_font = "Segoe UI"
+
         central = QWidget()
         self.setCentralWidget(central)
+
         main_h = QHBoxLayout(central)
-        main_h.setContentsMargins(0, 40, 0, 0)
+        main_h.setContentsMargins(0, 44, 0, 0)
         main_h.setSpacing(0)
 
         # LEFT PANEL
@@ -346,26 +973,29 @@ class MainWindow(QMainWindow):
         left.setObjectName("LeftPanel")
         left.setFixedWidth(300)
         v = QVBoxLayout(left)
-        v.setContentsMargins(18, 16, 18, 16)
-        v.setSpacing(10)
+        v.setContentsMargins(20, 12, 20, 16)
+        v.setSpacing(8)
 
-        lbl = QLabel("AMATERASU")
-        lbl.setFont(QFont(self.mc_font, 22, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #e03030;")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        v.addWidget(lbl)
-        v.addSpacing(6)
-
-        v.addWidget(QLabel("Ник:", styleSheet="color:#b07070;font-size:12px;"))
+        # ─── User section ───
+        nick_lbl = QLabel("Ник:")
+        nick_lbl.setObjectName("McLabel")
+        v.addWidget(nick_lbl)
         self.nick_edit = QLineEdit()
         self.nick_edit.setText("Steve")
         self.nick_edit.setMaxLength(16)
+        self.nick_edit.setPlaceholderText("Введи никнейм...")
         v.addWidget(self.nick_edit)
 
-        v.addWidget(QLabel("Версия:", styleSheet="color:#b07070;font-size:12px;"))
+        v.addSpacing(4)
+
+        ver_lbl = QLabel("Версия:")
+        ver_lbl.setObjectName("McLabel")
+        v.addWidget(ver_lbl)
         self.version_combo = QComboBox()
         self.version_combo.setEditable(False)
         v.addWidget(self.version_combo)
+
+        v.addSpacing(4)
 
         self.chk_def = QCheckBox("Отложенный запуск")
         v.addWidget(self.chk_def)
@@ -373,34 +1003,46 @@ class MainWindow(QMainWindow):
         self.chk_upd.setChecked(True)
         v.addWidget(self.chk_upd)
 
+        v.addSpacing(6)
+
         self.play_progress = QProgressBar()
-        self.play_progress.setMaximumHeight(18)
+        self.play_progress.setMaximumHeight(20)
         self.play_progress.setTextVisible(True)
         self.play_progress.setVisible(False)
         v.addWidget(self.play_progress)
 
-        self.play_btn = QPushButton("▶  ЗАПУСТИТЬ")
+        self.play_btn = AnimatedLaunchBtn("▶  ЗАПУСТИТЬ")
         self.play_btn.setObjectName("LaunchBtn")
-        self.play_btn.setFont(QFont(self.mc_font, 14, QFont.Weight.Bold))
         self.play_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.play_btn.clicked.connect(self._on_play)
 
-        glow = QGraphicsDropShadowEffect(self.play_btn)
-        glow.setColor(QColor(200, 30, 30, 180))
-        glow.setBlurRadius(22)
-        glow.setOffset(0, 0)
-        self.play_btn.setGraphicsEffect(glow)
+        self._btn_glow = QGraphicsDropShadowEffect(self.play_btn)
+        self._btn_glow.setColor(QColor(120, 40, 200, 180))
+        self._btn_glow.setBlurRadius(28)
+        self._btn_glow.setOffset(0, 0)
+        self.play_btn.setGraphicsEffect(self._btn_glow)
+        self.play_btn.set_glow(self._btn_glow)
         v.addWidget(self.play_btn)
 
-        v.addWidget(QLabel("Консоль:", styleSheet="color:#905050;font-size:11px;margin-top:2px;"))
+        v.addSpacing(4)
+
+        # ─── Separator ───
+        v.addWidget(GlowSeparator())
+
+        v.addSpacing(2)
+
+        console_lbl = QLabel("Консоль:")
+        console_lbl.setObjectName("ConsoleLabel")
+        v.addWidget(console_lbl)
         self.log_edit = QTextEdit()
         self.log_edit.setObjectName("Log")
         self.log_edit.setReadOnly(True)
-        self.log_edit.setMaximumHeight(90)
+        self.log_edit.setMaximumHeight(100)
         v.addWidget(self.log_edit)
 
+        # ─── Bottom icons ───
         icons_h = QHBoxLayout()
-        icons_h.setSpacing(6)
+        icons_h.setSpacing(8)
         icons_h.addStretch(1)
 
         self.btn_info = IconBtn("info", "Информация")
@@ -436,7 +1078,7 @@ class MainWindow(QMainWindow):
         self.right_panel.setVisible(False)
 
         rv = QVBoxLayout(self.right_panel)
-        rv.setContentsMargins(14, 14, 14, 14)
+        rv.setContentsMargins(16, 16, 16, 16)
         rv.setSpacing(10)
 
         self.right_stack = QStackedWidget()
@@ -454,7 +1096,12 @@ class MainWindow(QMainWindow):
         # TOP BAR
         self._build_title_bar()
 
-        self.setStyleSheet(stylesheet())
+        # ─── Particle overlay ───
+        self._particles = ParticleOverlay(central)
+        self._particles.setGeometry(central.rect())
+        self._particles.hide()
+
+        self.setStyleSheet(stylesheet(self.mc_font, self.title_font))
         self.refresh_main_versions()
 
         # ─── Если нет установленных версий — сразу открыть менеджер ───
@@ -471,13 +1118,12 @@ class MainWindow(QMainWindow):
         vv.setContentsMargins(0, 0, 0, 0)
         vv.setSpacing(10)
 
-        title = QLabel("Менеджер версий")
-        title.setFont(QFont(self.mc_font, 20, QFont.Weight.Bold))
-        title.setStyleSheet("color:#e03030;padding-bottom:8px;")
+        title = QLabel("⚡ Менеджер версий")
+        title.setObjectName("PageTitle")
         vv.addWidget(title)
 
         self.ver_search = QLineEdit()
-        self.ver_search.setPlaceholderText("Поиск версии...")
+        self.ver_search.setPlaceholderText("🔍 Поиск версии...")
         self.ver_search.textChanged.connect(self._filter_versions)
         vv.addWidget(self.ver_search)
 
@@ -485,26 +1131,29 @@ class MainWindow(QMainWindow):
         vv.addWidget(self.all_versions_list, 1)
 
         btn_h = QHBoxLayout()
+        btn_h.setSpacing(8)
         btn_back_v = QPushButton("← Назад")
         btn_back_v.setObjectName("ActBtn")
+        btn_back_v.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_back_v.clicked.connect(lambda: self._switch_page(0))
         btn_h.addWidget(btn_back_v)
         btn_h.addStretch(1)
 
-        self.btn_download = QPushButton("Скачать выбранную")
+        self.btn_download = QPushButton("⬇ Скачать")
         self.btn_download.setObjectName("ActBtn")
+        self.btn_download.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_download.clicked.connect(self._on_download_version)
         btn_h.addWidget(self.btn_download)
         vv.addLayout(btn_h)
 
         self.ver_progress = QProgressBar()
-        self.ver_progress.setMaximumHeight(18)
+        self.ver_progress.setMaximumHeight(20)
         self.ver_progress.setTextVisible(True)
         self.ver_progress.setVisible(False)
         vv.addWidget(self.ver_progress)
 
         self.ver_status = QLabel("")
-        self.ver_status.setStyleSheet("color:#905050;font-size:12px;")
+        self.ver_status.setObjectName("VersionLabel")
         vv.addWidget(self.ver_status)
         self.right_stack.addWidget(ver_page)
 
@@ -514,29 +1163,29 @@ class MainWindow(QMainWindow):
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(12)
 
-        title2 = QLabel("Настройки")
-        title2.setFont(QFont(self.mc_font, 20, QFont.Weight.Bold))
-        title2.setStyleSheet("color:#e03030;padding-bottom:8px;")
+        title2 = QLabel("⚙ Настройки")
+        title2.setObjectName("PageTitle")
         sv.addWidget(title2)
 
-        sv.addWidget(QLabel("Путь к Java (пусто = авто):", styleSheet="color:#b07070;font-size:12px;"))
+        sv.addWidget(QLabel("Путь к Java (пусто = авто):", styleSheet="color:#9080b0;font-size:12px;"))
         self.set_java = QLineEdit()
         self.set_java.setText(self.settings.get("java_path", ""))
+        self.set_java.setPlaceholderText("Автоопределение...")
         sv.addWidget(self.set_java)
 
-        sv.addWidget(QLabel("RAM:", styleSheet="color:#b07070;font-size:12px;"))
+        sv.addWidget(QLabel("RAM:", styleSheet="color:#9080b0;font-size:12px;"))
         self.set_ram = QComboBox()
         self.set_ram.addItems(["1G","2G","3G","4G","6G","8G","12G","16G"])
         self.set_ram.setCurrentText(self.settings.get("ram", "2G"))
         sv.addWidget(self.set_ram)
 
         dim = QHBoxLayout()
-        dim.addWidget(QLabel("Ширина окна MC:", styleSheet="color:#b07070;font-size:12px;"))
+        dim.addWidget(QLabel("Ширина окна MC:", styleSheet="color:#9080b0;font-size:12px;"))
         self.set_w = QLineEdit()
         self.set_w.setText(str(self.settings.get("window_width", 1000)))
         self.set_w.setFixedWidth(80)
         dim.addWidget(self.set_w)
-        dim.addWidget(QLabel("Высота:", styleSheet="color:#b07070;font-size:12px;"))
+        dim.addWidget(QLabel("Высота:", styleSheet="color:#9080b0;font-size:12px;"))
         self.set_h = QLineEdit()
         self.set_h.setText(str(self.settings.get("window_height", 600)))
         self.set_h.setFixedWidth(80)
@@ -544,11 +1193,14 @@ class MainWindow(QMainWindow):
         sv.addLayout(dim)
 
         btn_h = QHBoxLayout()
+        btn_h.setSpacing(8)
         btn_back_s = QPushButton("← Назад")
         btn_back_s.setObjectName("ActBtn")
+        btn_back_s.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_back_s.clicked.connect(lambda: self._switch_page(0))
-        btn_save = QPushButton("Сохранить")
+        btn_save = QPushButton("💾 Сохранить")
         btn_save.setObjectName("ActBtn")
+        btn_save.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_save.clicked.connect(self._save_settings)
         btn_h.addWidget(btn_back_s)
         btn_h.addWidget(btn_save)
@@ -558,42 +1210,167 @@ class MainWindow(QMainWindow):
         self.right_stack.addWidget(set_page)
 
         self._all_versions_raw = []
-        self._load_releases()
+        self._all_display_items = []
+        # Загрузка версий в фоне (не блокирует UI)
+        self._start_version_load()
+
+        # 3: Mods page
+        mod_page = QWidget()
+        mv = QVBoxLayout(mod_page)
+        mv.setContentsMargins(0, 0, 0, 0)
+        mv.setSpacing(12)
+
+        title3 = QLabel("🧩 Моды")
+        title3.setObjectName("PageTitle")
+        mv.addWidget(title3)
+
+        # ─── IBE Editor card ───
+        ibe_card = QFrame()
+        ibe_card.setStyleSheet("""
+            QFrame {
+                background-color: rgba(25, 12, 40, 200);
+                border: 1px solid rgba(120, 50, 180, 80);
+                border-radius: 10px;
+                padding: 14px;
+            }
+        """)
+        ibe_v = QVBoxLayout(ibe_card)
+        ibe_v.setSpacing(8)
+
+        ibe_title = QLabel("🏗 IBE Editor")
+        ibe_title.setStyleSheet("font-size:16px;font-weight:bold;color:#d0b0ff;border:none;background:transparent;")
+        ibe_v.addWidget(ibe_title)
+
+        ibe_desc = QLabel("Редактор структур для Minecraft 1.21.4\nNeoForge 21.4.157 + IBE Editor мод")
+        ibe_desc.setStyleSheet("color:#9080b0;font-size:12px;border:none;background:transparent;")
+        ibe_desc.setWordWrap(True)
+        ibe_v.addWidget(ibe_desc)
+
+        ibe_ver = QLabel("Версия мода: 1.0.0  •  MC 1.21.4  •  NeoForge")
+        ibe_ver.setStyleSheet("color:#7060a0;font-size:11px;border:none;background:transparent;")
+        ibe_v.addWidget(ibe_ver)
+
+        self.ibe_progress = QProgressBar()
+        self.ibe_progress.setMaximumHeight(18)
+        self.ibe_progress.setTextVisible(True)
+        self.ibe_progress.setVisible(False)
+        ibe_v.addWidget(self.ibe_progress)
+
+        self.ibe_status = QLabel("")
+        self.ibe_status.setStyleSheet("color:#9080b0;font-size:11px;border:none;background:transparent;")
+        ibe_v.addWidget(self.ibe_status)
+
+        self.btn_ibe_install = QPushButton("⬇ Установить IBE Editor 1.21.4")
+        self.btn_ibe_install.setObjectName("ActBtn")
+        self.btn_ibe_install.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_ibe_install.clicked.connect(self._on_install_ibe)
+        ibe_v.addWidget(self.btn_ibe_install)
+
+        mv.addWidget(ibe_card)
+
+        mv.addStretch(1)
+
+        # Back button
+        mod_back_h = QHBoxLayout()
+        btn_back_m = QPushButton("← Назад")
+        btn_back_m.setObjectName("ActBtn")
+        btn_back_m.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_back_m.clicked.connect(lambda: self._switch_page(0))
+        mod_back_h.addWidget(btn_back_m)
+        mod_back_h.addStretch(1)
+        mv.addLayout(mod_back_h)
+
+        self.right_stack.addWidget(mod_page)
 
     def _build_title_bar(self):
         self.title_bar = QWidget(self.centralWidget())
         self.title_bar.setObjectName("TopBar")
-        self.title_bar.setGeometry(0, 0, self.width(), 40)
+        self.title_bar.setGeometry(0, 0, self.width(), 44)
 
         h = QHBoxLayout(self.title_bar)
         h.setContentsMargins(14, 0, 6, 0)
-        h.setSpacing(0)
+        h.setSpacing(8)
 
-        lbl = QLabel("Amaterasu Launcher")
-        lbl.setStyleSheet("color:#e03030;font-size:14px;font-weight:bold;")
-        h.addWidget(lbl)
+        # ─── Иконка слева ───
+        icon_path = Path(__file__).parent.parent / "assets" / "icon_amaterasu.png"
+        icon_label = QLabel()
+        pix = QPixmap(str(icon_path))
+        if not pix.isNull():
+            pix = pix.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            icon_label.setPixmap(pix)
+        icon_label.setFixedSize(32, 32)
+        icon_label.setStyleSheet("background: transparent; border: none;")
+        h.addWidget(icon_label)
+
         h.addStretch(1)
 
-        btn_min = QPushButton("−")
+        # ─── Кнопки справа ───
+        btn_min = QPushButton("─")
         btn_min.setObjectName("WinBtn")
-        btn_min.setFixedSize(40, 30)
+        btn_min.setFixedSize(44, 34)
+        btn_min.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_min.clicked.connect(self.showMinimized)
 
         btn_close = QPushButton("✕")
         btn_close.setObjectName("CloseBtn")
-        btn_close.setFixedSize(40, 30)
+        btn_close.setFixedSize(44, 34)
+        btn_close.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_close.clicked.connect(self.close)
 
         for b in (btn_min, btn_close):
             h.addWidget(b)
 
+        # ─── 天照 абсолютно по центру title bar (overlay) ───
+        self._title_label = QLabel("天照", self.title_bar)
+        self._title_label.setObjectName("TitleBarLabel")
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._title_label.setStyleSheet("background: transparent;")
+
+        title_glow = QGraphicsDropShadowEffect(self._title_label)
+        title_glow.setColor(QColor(140, 60, 220, 120))
+        title_glow.setBlurRadius(16)
+        title_glow.setOffset(0, 0)
+        self._title_label.setGraphicsEffect(title_glow)
+        self._update_title_pos()
+
+    def _update_title_pos(self):
+        """Position 天照 at the center of the left panel area (fixed 300px)."""
+        if hasattr(self, "_title_label") and hasattr(self, "title_bar"):
+            lbl = self._title_label
+            lbl.adjustSize()
+            # Центрируем относительно левой панели (300px шириной)
+            left_panel_width = 300
+            x = (left_panel_width - lbl.width()) // 2
+            y = (self.title_bar.height() - lbl.height()) // 2 - 2
+            lbl.move(x, y)
+            lbl.move(x, y)
+
+    def paintEvent(self, event):
+        """Draw rounded window background."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 14, 14)
+        painter.setClipPath(path)
+        painter.fillRect(self.rect(), QColor(10, 4, 18))
+        painter.end()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # Rounded window mask
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 14, 14)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
         if hasattr(self, "title_bar"):
             self.title_bar.setFixedWidth(self.width())
+        self._update_title_pos()
+        if hasattr(self, "_particles"):
+            self._particles.setGeometry(self.centralWidget().rect())
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and event.position().y() < 40:
+        if event.button() == Qt.MouseButton.LeftButton and event.position().y() < 44:
             self._drag_pos = event.globalPosition().toPoint()
         super().mousePressEvent(event)
 
@@ -633,6 +1410,25 @@ class MainWindow(QMainWindow):
         self.log_edit.append(text)
         self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
 
+    def show(self):
+        super().show()
+        self._fade_in()
+
+    def _fade_in(self):
+        """Плавное появление окна."""
+        self._fade_opacity = 0.0
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(16)  # ~60fps
+        self._fade_timer.timeout.connect(self._fade_tick)
+        self._fade_timer.start()
+
+    def _fade_tick(self):
+        self._fade_opacity += 0.04  # ~0.6 сек до полной непрозрачности
+        if self._fade_opacity >= 1.0:
+            self._fade_opacity = 1.0
+            self._fade_timer.stop()
+        self.setWindowOpacity(self._fade_opacity)
+
     def _open_folder(self):
         import os
         os.startfile(self.mc_dir)
@@ -657,7 +1453,17 @@ class MainWindow(QMainWindow):
 
         self.log(f"📦 {version}...")
         self.play_btn.setEnabled(False)
-        self.play_btn.setText("⏳  ЗАГРУЗКА...")
+        self.play_btn.start_loading("ЗАГРУЗКА...")
+
+        # ─── Launch particles from button ───
+        btn_rect = self.play_btn.geometry()
+        # Convert to central widget coords
+        btn_pos = self.play_btn.mapTo(self.centralWidget(), QPoint(0, 0))
+        source_rect = self.play_btn.rect()
+        source_rect.moveTopLeft(btn_pos)
+        self._particles.setGeometry(self.centralWidget().rect())
+        self._particles.start(source_rect)
+
         self.play_progress.setVisible(True)
         self.play_progress.setMaximum(0)
         self.play_progress.setValue(0)
@@ -680,68 +1486,147 @@ class MainWindow(QMainWindow):
 
     def _on_play_done(self):
         self.play_btn.setEnabled(True)
-        self.play_btn.setText("▶  ЗАПУСТИТЬ")
+        self.play_btn.stop_loading("▶  ЗАПУСТИТЬ")
         self.play_progress.setVisible(False)
+        self._particles.stop()
 
     def _on_play_error(self, msg: str):
         self.log(f"❌ {msg}")
         self.play_btn.setEnabled(True)
-        self.play_btn.setText("▶  ЗАПУСТИТЬ")
+        self.play_btn.stop_loading("▶  ЗАПУСТИТЬ")
         self.play_progress.setVisible(False)
+        self._particles.stop()
+
+    def _start_version_load(self):
+        """Запускает загрузку списка версий в отдельном потоке."""
+        self.ver_status.setText("⏳ Загрузка списка версий...")
+        self.log("⏳ Загрузка списка версий...")
+        self._ver_thread = VersionListThread(self)
+        self._ver_thread.finished.connect(self._on_versions_loaded)
+        self._ver_thread.error.connect(lambda e: (
+            self.ver_status.setText(f"❌ {e}"),
+            self.log(f"❌ Ошибка: {e}")
+        ))
+        self._ver_thread.start()
+
+    def _on_versions_loaded(self, versions: list):
+        """Обработка загруженного списка версий."""
+        self.all_versions_list.clear()
+        self._all_versions_raw = []
+        self._all_display_items = []
+
+        if not versions:
+            self.ver_status.setText("❌ Список пуст — проверь интернет")
+            self.log("❌ Не удалось загрузить версии")
+            return
+
+        for v in versions:
+            if v.get("type") == "release":
+                self._all_versions_raw.append(v)
+                vid = v["id"]
+                self._all_display_items.append((vid, vid, "vanilla"))
+                self._all_display_items.append((f"{vid} — Forge", vid, "forge"))
+                self._all_display_items.append((f"{vid} — Fabric", vid, "fabric"))
+
+        for display, _, _ in self._all_display_items:
+            self.all_versions_list.addItem(display)
+
+        self.ver_status.setText(f"✅ Загружено {len(self._all_versions_raw)} релизов")
+        self.log(f"📋 Доступно {len(self._all_versions_raw)} версий")
 
     def _load_releases(self):
         self.all_versions_list.clear()
         self._all_versions_raw = []
+        self._all_display_items = []
         try:
-            for v in get_version_list():
+            versions = get_version_list()
+            if not versions:
+                self.ver_status.setText("❌ Не удалось загрузить список версий")
+                self.log("❌ Список версий пуст — проверь интернет")
+                return
+
+            for v in versions:
                 if v.get("type") == "release":
                     self._all_versions_raw.append(v)
-                    self.all_versions_list.addItem(v["id"])
+                    vid = v["id"]
+                    self._all_display_items.append((vid, vid, "vanilla"))
+                    self._all_display_items.append((f"{vid} — Forge", vid, "forge"))
+                    self._all_display_items.append((f"{vid} — Fabric", vid, "fabric"))
+
+            for display, _, _ in self._all_display_items:
+                self.all_versions_list.addItem(display)
             self.ver_status.setText(f"Загружено {len(self._all_versions_raw)} релизов")
+            self.log(f"📋 Доступно {len(self._all_versions_raw)} версий")
         except Exception as e:
-            self.ver_status.setText(f"Ошибка: {e}")
+            self.ver_status.setText(f"❌ Ошибка: {e}")
+            self.log(f"❌ Ошибка загрузки версий: {e}")
 
     def _filter_versions(self, text: str):
         self.all_versions_list.clear()
-        for v in self._all_versions_raw:
-            if text.lower() in v["id"].lower():
-                self.all_versions_list.addItem(v["id"])
+        search = text.lower().replace(".", "").replace(" ", "")
+        for display, vid, mod_type in self._all_display_items:
+            display_lower = display.lower()
+            display_clean = display_lower.replace(".", "").replace(" ", "").replace("—", "")
+            if text.lower() in display_lower or search in display_clean:
+                self.all_versions_list.addItem(display)
 
     def _on_download_version(self):
         item = self.all_versions_list.currentItem()
         if not item:
             self.ver_status.setText("Выбери версию из списка")
             return
-        ver = item.text()
-        self.ver_status.setText(f"Скачивание {ver}...")
+
+        display = item.text()
+
+        # Определяем тип: vanilla / forge / fabric
+        if "— Forge" in display:
+            mod_type = "forge"
+            mc_ver = display.replace(" — Forge", "").strip()
+        elif "— Fabric" in display:
+            mod_type = "fabric"
+            mc_ver = display.replace(" — Fabric", "").strip()
+        else:
+            mod_type = "vanilla"
+            mc_ver = display.strip()
+
+        self.ver_status.setText(f"Скачивание {display}...")
         self.btn_download.setEnabled(False)
         self.ver_progress.setVisible(True)
         self.ver_progress.setMaximum(0)
         self.ver_progress.setValue(0)
 
-        # ─── БЛОКИРУЕМ кнопку ЗАПУСТИТЬ пока идёт загрузка ───
         self.play_btn.setEnabled(False)
-        self.play_btn.setText("⏳  Ожидание загрузки...")
+        self.play_btn.start_loading("Ожидание загрузки...")
 
-        self.dl_thread = DownloadThread(ver, self.mc_dir, self)
-        self.dl_thread.log_signal.connect(self.log)
-        self.dl_thread.progress_signal.connect(self._on_ver_progress)
-        self.dl_thread.finished_signal.connect(lambda: (
-            self.ver_status.setText(f"✅ {ver} установлена"),
-            self.ver_progress.setVisible(False),
-            self.btn_download.setEnabled(True),
-            self.play_btn.setEnabled(True),
-            self.play_btn.setText("▶  ЗАПУСТИТЬ"),
-            self.refresh_main_versions()
-        ))
-        self.dl_thread.error_signal.connect(lambda msg: (
-            self.ver_status.setText(f"❌ {msg}"),
-            self.ver_progress.setVisible(False),
-            self.btn_download.setEnabled(True),
-            self.play_btn.setEnabled(True),
-            self.play_btn.setText("▶  ЗАПУСТИТЬ")
-        ))
-        self.dl_thread.start()
+        if mod_type == "vanilla":
+            self.dl_thread = DownloadThread(mc_ver, self.mc_dir, self)
+            self.dl_thread.log_signal.connect(self.log)
+            self.dl_thread.progress_signal.connect(self._on_ver_progress)
+            self.dl_thread.finished_signal.connect(lambda: self._on_dl_done(display))
+            self.dl_thread.error_signal.connect(self._on_dl_error)
+            self.dl_thread.start()
+        else:
+            self.mod_thread = ModInstallThread(mod_type, mc_ver, self.mc_dir, self)
+            self.mod_thread.log_signal.connect(self.log)
+            self.mod_thread.progress_signal.connect(self._on_ver_progress)
+            self.mod_thread.finished_signal.connect(lambda vid: self._on_dl_done(display))
+            self.mod_thread.error_signal.connect(self._on_dl_error)
+            self.mod_thread.start()
+
+    def _on_dl_done(self, display: str):
+        self.ver_status.setText(f"✅ {display} установлена")
+        self.ver_progress.setVisible(False)
+        self.btn_download.setEnabled(True)
+        self.play_btn.setEnabled(True)
+        self.play_btn.stop_loading("▶  ЗАПУСТИТЬ")
+        self.refresh_main_versions()
+
+    def _on_dl_error(self, msg: str):
+        self.ver_status.setText(f"❌ {msg}")
+        self.ver_progress.setVisible(False)
+        self.btn_download.setEnabled(True)
+        self.play_btn.setEnabled(True)
+        self.play_btn.stop_loading("▶  ЗАПУСТИТЬ")
 
     def _on_ver_progress(self, cur: int, tot: int):
         if tot > 0:
@@ -750,6 +1635,44 @@ class MainWindow(QMainWindow):
             self.ver_progress.setFormat(f"%p%  ({cur}/{tot})")
         else:
             self.ver_progress.setFormat("Загрузка...")
+
+    # ─── IBE Editor install ───
+
+    def _on_install_ibe(self):
+        self.btn_ibe_install.setEnabled(False)
+        self.ibe_status.setText("Начинаю установку...")
+        self.ibe_progress.setVisible(True)
+        self.ibe_progress.setMaximum(0)
+        self.ibe_progress.setValue(0)
+
+        self.ibe_thread = IBEInstallThread(self.mc_dir, self)
+        self.ibe_thread.log_signal.connect(self.log)
+        self.ibe_thread.progress_signal.connect(self._on_ibe_progress)
+        self.ibe_thread.finished_signal.connect(self._on_ibe_done)
+        self.ibe_thread.error_signal.connect(self._on_ibe_error)
+        self.ibe_thread.start()
+
+    def _on_ibe_progress(self, cur: int, tot: int):
+        if tot > 0:
+            self.ibe_progress.setMaximum(tot)
+            self.ibe_progress.setValue(cur)
+            self.ibe_progress.setFormat(f"Шаг {cur}/{tot}")
+        else:
+            self.ibe_progress.setFormat("Загрузка...")
+
+    def _on_ibe_done(self):
+        self.ibe_status.setText("✅ IBE Editor установлен! Выбери версию NeoForge в главном окне.")
+        self.ibe_progress.setVisible(False)
+        self.btn_ibe_install.setEnabled(True)
+        self.btn_ibe_install.setText("✅ Установлено — переустановить")
+        self.refresh_main_versions()
+        self.log("✅ IBE Editor 1.21.4 установлен!")
+
+    def _on_ibe_error(self, msg: str):
+        self.ibe_status.setText(f"❌ {msg}")
+        self.ibe_progress.setVisible(False)
+        self.btn_ibe_install.setEnabled(True)
+        self.log(f"❌ IBE Editor: {msg}")
 
     def _save_settings(self):
         self.settings["java_path"] = self.set_java.text().strip()
